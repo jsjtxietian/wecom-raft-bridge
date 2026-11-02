@@ -1,6 +1,6 @@
 import { loadConfig } from './config.js';
 import { hideSecrets, log, errorKind } from './log.js';
-import { createWecom } from './wecom.js';
+import { createWecom, conversationOf } from './wecom.js';
 import { RaftConnection } from './raft.js';
 import { Bridge } from './bridge.js';
 
@@ -14,6 +14,7 @@ async function main() {
   if (mode === 'check') return;
   const { client, port } = createWecom(cfg);
   const bridge = mode === 'run' ? new Bridge(cfg, raft!, port) : undefined;
+  if (bridge) log('bridge_modes', { allowPrivate: cfg.allowPrivate, allowGroup: cfg.allowGroup });
   let stopping = false, timer: ReturnType<typeof setTimeout> | undefined;
   let polling: Promise<void> = Promise.resolve();
   const tick = () => {
@@ -28,15 +29,16 @@ async function main() {
     if (stopping) return;
     if (mode === 'discover') {
       const m = frame.body;
-      if (m?.chattype === 'group' && m.aibotid === cfg.botId) log('wecom_group_discovered', {
-        chatId: m.chatid, senderId: m.from.userid, messageId: m.msgid,
+      const conversation = conversationOf(frame);
+      if (conversation && m?.aibotid === cfg.botId) log('wecom_conversation_discovered', {
+        chatType: conversation.type, chatId: conversation.id, senderId: m.from.userid, messageId: m.msgid,
       });
     } else void bridge!.accept(frame).catch(error => log('message_failed', { kind: errorKind(error) }));
   });
   let initialized = false;
   client.on('authenticated', () => {
     if (bridge && !initialized) { initialized = true; tick(); }
-    if (mode === 'discover') log('discover_ready', { instruction: '请在目标企微群 @机器人 发一句话，将日志中的 chatId 填入 .env 的 WECOM_CHAT_ID。' });
+    if (mode === 'discover') log('discover_ready', { instruction: '请私聊机器人，或在群里 @机器人 发一句话；本模式只记录会话信息，不转发任务。正常运行无需填写群 ID。' });
   });
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => {
     stopping = true; clearTimeout(timer);

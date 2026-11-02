@@ -4,6 +4,15 @@ import type { Config } from './config.js';
 import { log, errorKind } from './log.js';
 
 export type TextFrame = WsFrame<TextMessage>;
+export interface Conversation { type: 'single' | 'group'; id: string; }
+export function conversationOf(frame: TextFrame): Conversation | undefined {
+  const m = frame.body;
+  if (!m || (m.chattype !== 'single' && m.chattype !== 'group')) return;
+  // Private callbacks have no chatid. The official SDK accepts userid as the send target.
+  const id = m.chattype === 'single' ? m.from?.userid : m.chatid;
+  if (typeof id !== 'string' || !id.trim()) return;
+  return { type: m.chattype, id };
+}
 export interface WecomPort {
   acknowledge(frame: TextFrame, content: string): Promise<void>;
   send(chatId: string, content: string): Promise<void>;

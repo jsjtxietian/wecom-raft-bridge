@@ -5,6 +5,7 @@ import { log, BridgeError } from './log.js';
 
 export interface RaftPort {
   send(content: string, sourceId: string): Promise<string>;
+  ensureThread(messageId: string): Promise<string>;
   receive(since?: number): Promise<RaftEventsReceiveData>;
 }
 
@@ -40,17 +41,20 @@ export class RaftConnection implements RaftPort {
     if (!result.ok) throw new BridgeError(`Raft send refused (${result.status ?? result.error.kind})`);
     if (result.data.state !== 'sent' || !result.data.messageId) throw new BridgeError(`Raft send not confirmed (${result.data.state})`);
     const messageId = result.data.messageId;
-    // Follow our own request thread so replies also enter this External Agent's inbox.
-    try {
-      const followed = await this.client.routes.threads.follow({ body: { thread: `${this.cfg.channel}:${messageId.slice(0, 8)}` } });
-      if (!followed.ok) log('raft_follow_failed', { messageId, status: followed.status });
-    } catch { log('raft_follow_failed', { messageId }); }
     try {
       const delivery = await this.client.routes.mentions.senderDeliveries({ params: { messageId } });
       if (delivery.ok) log('raft_mention_delivery', { messageId, deliveries: delivery.data.deliveries });
       else log('raft_mention_check_failed', { messageId, status: delivery.status });
     } catch { log('raft_mention_check_failed', { messageId }); }
     return messageId;
+  }
+  async ensureThread(messageId: string): Promise<string> {
+    const target = `${this.cfg.channel}:${messageId.slice(0, 8)}`;
+    const followed = await this.client.routes.threads.follow({ body: { thread: target } });
+    if (!followed.ok) throw new BridgeError('Raft thread follow failed');
+    const resolved = await this.client.routes.channels.resolve({ body: { target } });
+    if (!resolved.ok || !resolved.data.channelId) throw new BridgeError('Raft thread resolve failed');
+    return resolved.data.channelId;
   }
   async receive(since?: number): Promise<RaftEventsReceiveData> {
     const result = await this.client.events.receive({ since, ack: 'cursor', limit: 100 });
