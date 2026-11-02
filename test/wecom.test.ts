@@ -22,12 +22,14 @@ test('official SDK authenticates, receives callbacks, replies with original req_
     const received = new Promise<TextFrame>(resolve => client.once('message.text', resolve));
     client.connect();
     const frame = await received;
-    await port.acknowledge(frame, '已收到');
+    await port.acknowledge(frame, '已交给 @Sol。');
     await port.send('group-1', '[Sol] hello');
     assert.equal(frames[0]!.body.bot_id, 'bot-1');
     const ack = frames.find(f => f.cmd === 'aibot_respond_msg')!;
     assert.equal(ack.headers.req_id, 'original-request');
     assert.equal(ack.body.stream.finish, true);
+    assert.equal(ack.body.stream.content, '已交给 @Sol。');
+    assert.equal(frames.filter(f => f.cmd === 'aibot_respond_msg').length, 1);
     const push = frames.find(f => f.cmd === 'aibot_send_msg')!;
     assert.equal(push.body.chatid, 'group-1');
     assert.equal(push.body.markdown.content, '[Sol] hello');

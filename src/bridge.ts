@@ -41,11 +41,7 @@ export class Bridge {
     if (!content) return this.wecom.acknowledge(frame, '请在 @机器人 后输入任务内容。');
     if (this.inFlight.size >= 100) return this.wecom.acknowledge(frame, '当前队列已满，请稍后重试。');
     log('wecom_received', { messageId: m.msgid, chatId: m.chatid, senderId: m.from.userid });
-    // Start the protocol reply immediately, even when another request is queued.
-    const acknowledged = this.wecom.acknowledge(frame, '已收到，正在提交 Raft。')
-      .catch(error => log('wecom_ack_failed', { messageId: m.msgid, kind: errorKind(error) }));
     const work = this.queue.then(async () => {
-      await acknowledged;
       let raftId: string | undefined;
       const body = `${this.cfg.targetAgent}\n\n${content}`;
       for (let attempt = 1; attempt <= 3; attempt++) {
@@ -59,8 +55,9 @@ export class Bridge {
         this.inbound.add(key);
         log('raft_posted', { sourceMessageId: m.msgid, raftMessageId: raftId, chatId: m.chatid, senderId: m.from.userid });
       }
+      // Reply once to the original callback, only after Raft confirms the result.
       // A notification failure must never resend an already accepted Raft task.
-      await this.wecom.send(this.cfg.chatId, raftId ? `已提交 Raft，交给 ${this.cfg.targetAgent}。`
+      await this.wecom.acknowledge(frame, raftId ? `已交给 ${this.cfg.targetAgent}。`
         : '暂时无法确认投递结果，请在 Raft 频道查看是否收到任务，避免重复提交。')
         .catch(error => log('wecom_notice_failed', { messageId: m.msgid, kind: errorKind(error) }));
     }).finally(() => { this.inFlight.delete(key); });

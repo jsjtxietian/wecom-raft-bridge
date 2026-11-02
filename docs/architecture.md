@@ -19,7 +19,7 @@
 
 `since: 'latest'` 不会跳过历史排队消息。本版通过启动时间过滤旧消息，不补发停机期间的回复。不同 agent 的新回复均可回传，桥接不介入它们的任务协作。
 
-企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`，通过 `replyStream` 和原始 `req_id` 尽快确认接收并结束该流；后续通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。
+企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`，等 Raft 确认发送成功后，通过 `replyStream` 和原始 `req_id` 一次性回复“已交给 @Sol。”并结束该流，不额外发送“正在提交”状态。后续 agent 回复通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。
 
 代码为本项目独立实现，参考上述桥接思路；未复制原项目的状态存储、飞书业务逻辑或 agent 行为规则。第三方包遵循各自许可证；原参考项目及其许可证仍留在本地 `ref/`，不加入此 Git 仓库。
 

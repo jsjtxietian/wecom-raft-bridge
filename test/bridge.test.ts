@@ -23,7 +23,7 @@ function setup(events: RaftEvent[] = []) {
     async receive(cursor) { cursors.push(cursor); return { events, lastSeenSeq: 42, ackMode: 'cursor', hasMore: false,
       lastSeenMessageId: null, replyTarget: null } satisfies RaftEventsReceiveData; },
   };
-  const wecom: WecomPort = { async acknowledge() { calls.push('ack'); }, async send(_chat, text) { calls.push(text); } };
+  const wecom: WecomPort = { async acknowledge(_frame, text) { calls.push(text); }, async send(_chat, text) { calls.push(text); } };
   return { calls, posts, cursors, raft, wecom, bridge: new Bridge(cfg, raft, wecom, async () => {}) };
 }
 
@@ -38,11 +38,19 @@ test('UTF-8 splitting preserves Chinese and emoji', () => {
   assert.equal(parts.join(''), input);
   assert.ok(parts.every(part => Buffer.byteLength(part) <= 3500));
 });
-test('ack first, plain task with fixed mention, concurrent duplicate sends once', async () => {
+test('one confirmation after Raft succeeds, plain task and concurrent deduplication', async () => {
   const s = setup();
-  await Promise.all([s.bridge.accept(frame()), s.bridge.accept(frame())]);
+  let confirmSend!: (messageId: string) => void;
+  const sent = new Promise<string>(resolve => { confirmSend = resolve; });
+  const originalSend = s.raft.send;
+  s.raft.send = async (body, key) => { await originalSend(body, key); return sent; };
+  const first = s.bridge.accept(frame()), duplicate = s.bridge.accept(frame());
+  await Promise.resolve();
+  assert.deepEqual(s.calls, ['raft']);
+  confirmSend('raft-1');
+  await Promise.all([first, duplicate]);
   await s.bridge.accept(frame());
-  assert.deepEqual(s.calls, ['ack', 'raft', '已提交 Raft，交给 @Sol。']);
+  assert.deepEqual(s.calls, ['raft', '已交给 @Sol。']);
   assert.equal(s.posts[0]!.body, '@Sol\n\n请检查 a@b.com 和 @另一个人');
   assert.equal(s.posts.length, 1);
 });
@@ -58,10 +66,11 @@ test('failure retries use the same key and never claim submission', async () => 
   s.raft.send = async (_body, key) => { keys.push(key); throw new Error('timeout'); };
   await s.bridge.accept(frame());
   assert.equal(keys.length, 3); assert.equal(new Set(keys).size, 1);
-  assert.ok(s.calls.every(text => !text.startsWith('已提交')));
+  assert.equal(s.calls.length, 1);
+  assert.ok(s.calls.every(text => !text.startsWith('已交给')));
 });
 test('notification failure does not resend accepted Raft request', async () => {
-  const s = setup(); s.wecom.send = async () => { throw new Error('disconnect'); };
+  const s = setup(); s.wecom.acknowledge = async () => { throw new Error('disconnect'); };
   await s.bridge.accept(frame()); await s.bridge.accept(frame());
   assert.equal(s.posts.length, 1);
 });
