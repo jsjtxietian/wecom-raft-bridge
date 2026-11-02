@@ -1,0 +1,28 @@
+{
+  "name": "wecom-raft-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "discover": "tsx src/main.ts discover",
+    "check": "tsx src/main.ts check",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@botiverse/raft-sdk": "0.32.0",
+    "@wecom/aibot-node-sdk": "1.0.7",
+    "dotenv": "17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.0",
+    "@types/ws": "8.18.1",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "ws": "8.21.0"
+  }
+}
