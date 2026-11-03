@@ -28,6 +28,23 @@ export function cleanText(content: string, botId: string, botName: string): stri
   return text.trim();
 }
 
+export function withQuote(question: string, quote: TextMessage['quote']): string {
+  if (!quote) return question;
+  const textOf = (value: unknown) => typeof value === 'string' ? value.trim() : '';
+  let context = '';
+  if (quote.msgtype === 'text') context = textOf(quote.text?.content);
+  else if (quote.msgtype === 'mixed' && Array.isArray(quote.mixed?.msg_item)) {
+    context = quote.mixed.msg_item.map(item => item?.msgtype === 'text'
+      ? textOf(item.text?.content) : '（引用中的非文字内容未读取）').filter(Boolean).join('\n');
+  }
+  if (!context) context = quote.msgtype === 'text'
+    ? '（引用文字为空或无法读取）' : '（此类型的引用暂未读取；当前仅支持文字和图文中的文字）';
+  // Historical mentions are context, not new wake-ups. Keep email addresses intact.
+  const quoted = context.replace(/\r\n?/g, '\n').replace(/(?<![A-Za-z0-9._%+-])@(?=[A-Za-z0-9_-])/g, '＠')
+    .split('\n').map(line => `> ${line}`).join('\n');
+  return `引用内容：\n${quoted}\n\n本次提问：\n${question}`;
+}
+
 export function splitText(text: string, maxBytes = 3500): string[] {
   const chunks: string[] = [];
   let current = '', bytes = 0;

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { WebSocketServer } from 'ws';
-import { createWecom, conversationOf, type TextFrame } from '../src/wecom.js';
+import { createWecom, conversationOf, withQuote, type TextFrame } from '../src/wecom.js';
 import type { Config } from '../src/config.js';
 
 for (const chatType of ['group', 'single'] as const) test(`official SDK receives ${chatType} and sends to its group/user id`, async () => {
@@ -16,7 +16,8 @@ for (const chatType of ['group', 'single'] as const) test(`official SDK receives
     if (frame.cmd === 'aibot_subscribe') socket.send(JSON.stringify({ cmd: 'aibot_msg_callback',
       headers: { req_id: 'original-request' }, body: { msgid: 'message-1', aibotid: 'bot-1',
         ...(chatType === 'group' ? { chatid: 'group-1' } : {}),
-        chattype: chatType, from: { userid: 'person-1' }, msgtype: 'text', text: { content: 'hello' } } }));
+        chattype: chatType, from: { userid: 'person-1' }, msgtype: 'text', text: { content: 'hello' },
+        quote: { msgtype: 'text', text: { content: '引用测试 🌍' } } } }));
   }));
   const { client, port } = createWecom({ botId: 'bot-1', secret: 'fake-secret' } as Config, `ws://127.0.0.1:${address.port}`);
   try {
@@ -26,6 +27,7 @@ for (const chatType of ['group', 'single'] as const) test(`official SDK receives
     const conversation = conversationOf(frame)!;
     const destination = chatType === 'group' ? 'group-1' : 'person-1';
     assert.deepEqual(conversation, { type: chatType, id: destination });
+    assert.equal(withQuote(frame.body!.text.content, frame.body!.quote), '引用内容：\n> 引用测试 🌍\n\n本次提问：\nhello');
     await port.acknowledge(frame, '当前队列已满，请稍后重试。');
     await port.send(conversation.id, '[Sol] hello');
     assert.equal(frames[0]!.body.bot_id, 'bot-1');

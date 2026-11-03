@@ -1,7 +1,7 @@
 import type { RaftEvent } from '@botiverse/raft-sdk';
 import type { Config } from './config.js';
 import type { RaftPort } from './raft.js';
-import { cleanText, splitText, conversationOf, type Conversation, type TextFrame, type WecomPort } from './wecom.js';
+import { cleanText, withQuote, splitText, conversationOf, type Conversation, type TextFrame, type WecomPort } from './wecom.js';
 import { errorKind, log } from './log.js';
 
 export function belongsToChannel(event: RaftEvent, channel: string): boolean {
@@ -44,10 +44,12 @@ export class Bridge {
     const content = cleanText(m.text.content, this.cfg.botId, this.cfg.botName);
     if (!content) return this.wecom.acknowledge(frame, '请输入任务内容。');
     if (this.inFlight.size + this.pendingRoutes.size >= 100) return this.wecom.acknowledge(frame, '当前队列已满，请稍后重试。');
-    log('wecom_received', { messageId: m.msgid, chatType: conversation.type, chatId: conversation.id, senderId: m.from.userid });
+    const task = withQuote(content, m.quote);
+    log('wecom_received', { messageId: m.msgid, chatType: conversation.type, chatId: conversation.id,
+      senderId: m.from.userid, hasQuote: Boolean(m.quote) });
     const work = this.queue.then(async () => {
       let raftId: string | undefined;
-      const body = `${this.cfg.targetAgent}\n\n${content}`;
+      const body = `${this.cfg.targetAgent}\n\n${task}`;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try { raftId = await this.raft.send(body, `${this.cfg.botId}:${key}`); break; }
         catch (error) {

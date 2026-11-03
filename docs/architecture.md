@@ -29,6 +29,14 @@
 
 企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`，正常提交不调用 `replyStream`，不发送提交确认或创建空的回复流。投递失败、空任务和队列已满时，才通过 `replyStream` 和原始 `req_id` 回复提示并结束该流。agent 回复通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。是否只发送最终结论由 Raft agent 的频道约定决定，桥接不按文本猜测或过滤进度消息。
 
+## 引用提问
+
+企微[接收消息协议](https://developer.work.weixin.qq.com/document/path/100719)和 SDK `QuoteContent` 定义了 `quote.text.content` 等引用内容字段；长连接文档说明消息体结构沿用该协议。桥接从当前 `message.text` 回调读取 `quote`，提取文本或图文混排中的文字，以 Markdown 引用块与本次问题分开呈现。空引用及未接入的媒体引用用简短占位说明，不把资源 URL 当作正文或下载资源。
+
+引用中的 ASCII agent mention 使用全角 `＠` 展示，避免历史提及再次唤醒 agent；本次问题的 mention 和邮箱保持原样。引用前后仍是一条独立 Raft 任务，回传依据本次来源会话；不凭引用文字猜测旧任务 ID。日志仅增加 `hasQuote` 标记，不记录引用正文。
+
+本次只使用长连接消息回调携带的引用内容。其他 MCP 可能提供历史读取能力，未在此项目核实或接入；不据当前长连接接口的字段推断整个企微平台没有历史能力。
+
 代码为本项目独立实现，参考上述桥接思路；未复制原项目的状态存储、飞书业务逻辑或 agent 行为规则。第三方包遵循各自许可证；原参考项目及其许可证仍留在本地 `ref/`，不加入此 Git 仓库。
 
 参考：[企微 SDK](https://github.com/WecomTeam/aibot-node-sdk)、[企微官方协议](https://developer.work.weixin.qq.com/document/path/101463)、[Raft External Agent](https://docs.raft.build/developers/sdk/external-agents/)。

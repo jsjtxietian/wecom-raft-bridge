@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { RaftEvent, RaftEventsReceiveData } from '@botiverse/raft-sdk';
 import { Bridge, belongsToChannel } from '../src/bridge.js';
 import type { Config } from '../src/config.js';
-import { cleanText, splitText, type TextFrame, type WecomPort } from '../src/wecom.js';
+import { cleanText, withQuote, splitText, type TextFrame, type WecomPort } from '../src/wecom.js';
 import type { RaftPort } from '../src/raft.js';
 
 const cfg: Config = { botId: 'bot-id', secret: 'test-secret', botName: '桥接机器人', allowPrivate: true, allowGroup: true,
@@ -59,6 +59,48 @@ test('successful submission stays silent, preserves plain task and deduplicates 
   assert.equal(s.posts[0]!.body, '@Sol\n\n请检查 a@b.com 和 @另一个人');
   assert.equal(s.posts.length, 1);
 });
+test('quoted questions in private and group chats carry context and route replies to the source', async () => {
+  for (const type of ['single', 'group'] as const) {
+    const s = setup([event()]);
+    const f = frame('quoted', { chattype: type, chatid: type === 'group' ? 'quote-group' : undefined,
+      text: { content: '@桥接机器人 为什么？请问 @Helper' },
+      quote: { msgtype: 'text', text: { content: '@Sol 不支持导出\r\n邮箱：user@example.com\r\n\r\n第二段' } } });
+    await Promise.all([s.bridge.accept(f), s.bridge.accept(f)]);
+    assert.equal(s.posts.length, 1);
+    assert.equal(s.posts[0]!.body,
+      '@Sol\n\n引用内容：\n> ＠Sol 不支持导出\n> 邮箱：user@example.com\n> \n> 第二段\n\n本次提问：\n为什么？请问 @Helper');
+    assert.deepEqual(s.calls, ['raft']);
+    await s.bridge.poll();
+    assert.deepEqual(s.sent, [{ chatId: type === 'group' ? 'quote-group' : 'person-1', text: '[Sol] 任务完成' }]);
+  }
+});
+
+test('mixed quotes include available text but never treat media URLs as readable content', () => {
+  const text = withQuote('说明一下', { msgtype: 'mixed', mixed: { msg_item: [
+    { msgtype: 'text', text: { content: '第一段' } },
+    { msgtype: 'image', image: { url: 'https://example.test/private-media' } },
+    { msgtype: 'text', text: { content: '第二段' } },
+  ] } });
+  assert.equal(text, '引用内容：\n> 第一段\n> （引用中的非文字内容未读取）\n> 第二段\n\n本次提问：\n说明一下');
+  assert.ok(!text.includes('private-media'));
+});
+
+test('empty or unsupported quotes preserve the question; a quote alone does not become a task', async () => {
+  for (const quote of [{ msgtype: 'text', text: { content: '  ' } },
+    { msgtype: 'file', file: { url: 'https://example.test/private-file' } },
+    { msgtype: 'text', text: { content: 123 } }]) {
+    const f = frame('empty-quote'); f.body!.quote = quote as NonNullable<TextFrame['body']>['quote'];
+    const s = setup(); await s.bridge.accept(f);
+    assert.ok(s.posts[0]!.body.endsWith('本次提问：\n请检查 a@b.com 和 @另一个人'));
+    assert.ok(!s.posts[0]!.body.includes('private-file'));
+  }
+  const s = setup();
+  await s.bridge.accept(frame('no-question', { text: { content: '@桥接机器人' },
+    quote: { msgtype: 'text', text: { content: '旧任务' } } }));
+  assert.equal(s.posts.length, 0);
+  assert.deepEqual(s.calls, ['请输入任务内容。']);
+});
+
 test('wrong bot, missing group id and unsupported messages never enter Raft', async () => {
   const s = setup();
   for (const patch of [{ chatid: undefined }, { chattype: 'unknown' }, { aibotid: 'other' },
