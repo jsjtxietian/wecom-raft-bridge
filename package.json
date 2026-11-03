@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tsx src/main.ts",
+    "start": "node scripts/bridge.mjs run",
+    "start:bg": "node scripts/bridge.mjs start",
+    "stop": "node scripts/bridge.mjs stop",
+    "status": "node scripts/bridge.mjs status",
     "discover": "tsx src/main.ts discover",
     "check": "tsx src/main.ts check",
     "typecheck": "tsc --noEmit",

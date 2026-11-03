@@ -293,3 +293,66 @@ test('failed session persistence blocks continuation until saved, without repost
   assert.equal(s.posts[1]!.rootMessageId, 'raft-1');
   assert.deepEqual(s.sent, [{ chatId: 'user-A', text: '[Sol] 任务完成' }]);
 });
+
+test('/new switches only the sender; queued follow-ups share a new root and old replies still return', async () => {
+  const s = setup([event(), event({ messageId: 'new-reply', channelId: 'thread-raft-3' })]);
+  await s.bridge.accept(privateFrame('A1'));
+  await s.bridge.accept(privateFrame('B1', 'user-B'));
+  const reset = privateFrame('reset'); reset.body!.text.content = ' /new ';
+  await Promise.all([s.bridge.accept(reset), s.bridge.accept(privateFrame('A2')),
+    s.bridge.accept(privateFrame('A3')), s.bridge.accept(reset)]);
+  await s.bridge.accept(privateFrame('B2', 'user-B'));
+  assert.deepEqual(s.posts.map(p => p.rootMessageId), [undefined, undefined, undefined, 'raft-3', 'raft-2']);
+  assert.equal(s.calls.filter(text => text === '已切换新话题，请发送新的任务。').length, 1);
+  assert.equal(s.sessions.get('user-A')!.rootMessageId, 'raft-3');
+  await s.bridge.poll();
+  assert.deepEqual(s.sent.map(p => p.chatId), ['user-A', 'user-A']);
+});
+
+test('new-topic commands are standalone, private-only, and never sent as group tasks', async () => {
+  const s = setup();
+  for (const command of ['/new', '新话题']) {
+    const f = frame(command); f.body!.text.content = `@桥接机器人 ${command}`;
+    await s.bridge.accept(f);
+  }
+  assert.equal(s.posts.length, 0);
+  assert.ok(s.calls.every(text => text.includes('群聊每条提问')));
+  const first = privateFrame('start-new'); first.body!.text.content = '新话题';
+  await s.bridge.accept(first);
+  assert.equal(s.sessions.all().length, 0);
+  for (const [index, content] of ['解释 /new 的意思', '/new 请帮忙', '/new'].entries()) {
+    const f = privateFrame(`text-${index}`); f.body!.text.content = content;
+    if (index === 2) f.body!.quote = { msgtype: 'text', text: { content: '引用的问题' } };
+    await s.bridge.accept(f);
+  }
+  assert.equal(s.posts.length, 3);
+  assert.deepEqual(s.posts.map(p => p.rootMessageId), [undefined, 'raft-1', 'raft-1']);
+});
+
+test('a failed reset keeps the old conversation and reports failure before any confirmation', async () => {
+  const s = setup();
+  await s.bridge.accept(privateFrame('first'));
+  const reset = privateFrame('reset'); reset.body!.text.content = '/new';
+  s.sessions.reset = async () => { throw new Error('disk full'); };
+  await s.bridge.accept(reset);
+  await s.bridge.accept(privateFrame('next'));
+  assert.equal(s.posts[1]!.rootMessageId, 'raft-1');
+  assert.ok(s.calls.includes('新话题未能保存，请稍后重试；原会话保持不变。'));
+  assert.ok(!s.calls.includes('已切换新话题，请发送新的任务。'));
+});
+
+test('replayed reset and retired first messages cannot reset or resurrect a topic after reload', async () => {
+  const sessions = new PrivateSessions();
+  sessions.remember({ userId: 'user-A', rootMessageId: 'old-root', firstSourceId: 'bot-id:single:user-A:first' });
+  await sessions.reset('user-A', 'bot-id:single:user-A:reset');
+  sessions.remember({ userId: 'user-A', rootMessageId: 'new-root', firstSourceId: 'bot-id:single:user-A:second' });
+  const s = setup([event({ channelId: 'thread-old-root' })], {}, sessions);
+  const reset = privateFrame('reset'); reset.body!.text.content = '/new';
+  await s.bridge.accept(reset);
+  await s.bridge.accept(privateFrame('first'));
+  await s.bridge.accept(privateFrame('third'));
+  assert.equal(s.posts.length, 1);
+  assert.equal(s.posts[0]!.rootMessageId, 'new-root');
+  await s.bridge.poll();
+  assert.equal(s.sent[0]!.chatId, 'user-A');
+});

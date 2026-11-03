@@ -35,9 +35,23 @@
 
 后续消息调用 `messages.send`，其 `target` 为固定根消息的 `#channel:shortid`。首条回调重放时通过保存的来源标识识别，不把相同消息再发到它自己的 thread；其他重试保持原目标和幂等键。线程无法关注或解析时提示用户，绝不自动回退到频道创建新会话。没有超时或自动切换话题；上下文由 Raft agent 读取。
 
+参考飞书 0.4.2 没有 `/new` 命令，其会话边界来自飞书话题。这里提供企微私聊的显式边界：整条无引用的 `/new`（不区分大小写）或“新话题”在串行队列内执行，先保存切换，再确认；下一条任务才创建根消息。失败时回滚当前映射，不宣称切换成功；不会向 Raft 发送重开命令。群聊只提示现有的逐条新建规则。
+
+状态格式升级到 version 2，并兼容读取 version 1。保留当前私聊映射、最近 1,000 个旧线程路由和最近 1,000 条重开来源标识；回调重放不会再次切换最近已完成的重开操作，旧根消息重放也不会成为新任务。旧线程继续恢复回传，不取消 agent 的在途工作，不改变其历史访问权限。重开命令只在本次提问正文独立匹配，引用和普通句子中的命令不执行。
+
 本次只持久化私聊映射，不实现完整 journal、停机期间补发或群聊恢复。外部发送成功但私聊映射尚未落盘时仍存在崩溃窗口；原消息再次投递可依赖稳定幂等键恢复根消息，但不能据此承诺任意崩溃场景都不丢状态。
 
-企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`，正常提交不调用 `replyStream`，不发送提交确认或创建空的回复流。投递失败、空任务和队列已满时，才通过 `replyStream` 和原始 `req_id` 回复提示并结束该流。agent 回复通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。是否只发送最终结论由 Raft agent 的频道约定决定，桥接不按文本猜测或过滤进度消息。
+企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`，正常任务提交不调用 `replyStream`，不发送提交确认或创建空的回复流。投递失败、空任务、队列已满和重开命令的反馈，通过 `replyStream` 和原始 `req_id` 回复提示并结束该流。agent 回复通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。是否只发送最终结论由 Raft agent 的频道约定决定，桥接不按文本猜测或过滤进度消息。
+
+## 跨平台启动管理
+
+参考飞书的 `bin/start.sh` 和 `main.ts` 的单实例检查思路，独立实现 `scripts/bridge.mjs` 与 `runtime.mjs`；不复制其 Bash/macOS `caffeinate` 行为。Windows `.cmd` 和 POSIX `.sh` 只定位并启动 Node.js，平台相关文件路径和子进程均交给 Node 标准库。启动器不依赖 tsx 即可显示状态及安装提示；工作进程用已安装的 tsx loader 运行 TypeScript。
+
+工作进程在访问 Raft、连接企微前绑定 `127.0.0.1` 控制端口，以操作系统的独占 bind 防止同一项目并发启动；端口由规范化项目路径哈希确定（40000–59999）。发生端口冲突时拒绝启动，不结束占用者、不切换端口绕过锁。状态读取校验应用及路径；停止须携带 `.local/bridge-control.json` 内每次启动生成的随机 token，通知现有进程走 drain/disconnect。该文件只含本地控制凭据和进程元数据，不含企微、Raft 凭据，且已被 Git 忽略。PID 只用于显示，不据此结束任何进程；崩溃残留文件可在下一次成功 bind 后覆盖。
+
+`npm start` 前台运行，`npm run start:bg` 使用独立后台进程并追加日志；`stop` 和 `status` 在三种操作系统上保持相同语义。主入口即使通过 tsx 直接运行或进入 discover 模式，也必须取得相同的锁。`check` 不建立企微连接，因此可以与主服务同时运行。状态中的“企微已认证”描述当前企微连接；不表示每一条任务都已完成，也不持续探测 Raft 健康。
+
+不安装系统服务或自动启动项，不阻止电脑休眠。macOS/Linux 的退出登录策略及系统休眠仍可能停止或暂停进程；需要长期服务时由维护者另行配置运行环境。多目录/多机器的同 bot 冲突不在本地锁的检测范围；升级前已经运行的旧版本需先自行停止。
 
 ## 引用提问
 
@@ -60,6 +74,7 @@
 | `bridge_modes` | 当前私聊/群聊开关 |
 | `private_sessions_loaded` | 启动时加载的私聊会话数 |
 | `private_session_unavailable` / `private_session_save_failed` | 原私聊无法恢复 / 已提交但映射保存失败 |
+| `private_session_reset` / `private_session_reset_failed` | 私聊重开已保存 / 保存失败，保留原话题 |
 | `wecom_conversation_discovered` | 排错模式下收到的私聊/群聊元数据 |
 | `wecom_received` / `raft_posted` | 收到企微消息 / Raft 已确认发送 |
 | `raft_mention_delivery` | mention 投递状态；`pending` 尚未确认，`delivered` 已投递 |

@@ -67,3 +67,49 @@ test('a failed save retains the accepted mapping and succeeds after the storage 
   await store.flush();
   assert.deepEqual(JSON.parse(await readFile(store.file!, 'utf8')).sessions, [session]);
 });
+
+test('reset survives reload before and after the next task, retaining old reply routes and reset dedupe', async t => {
+  const dir = await directory(t), store = await PrivateSessions.load(cfg, dir);
+  store.remember(session); await store.flush();
+  await store.reset('user-A', 'reset-A');
+  const empty = await PrivateSessions.load(cfg, dir);
+  assert.equal(empty.get('user-A'), undefined);
+  assert.deepEqual(empty.routes(), [session]);
+  assert.ok(empty.hasFirstSource('source-A'));
+  assert.ok(empty.hasReset('reset-A'));
+  const next = { ...session, rootMessageId: 'new-root', firstSourceId: 'new-source' };
+  empty.remember(next); await empty.flush();
+  const restored = await PrivateSessions.load(cfg, dir);
+  await restored.reset('user-A', 'reset-A');
+  assert.deepEqual(restored.get('user-A'), next);
+  assert.equal(restored.routes().length, 2);
+});
+
+test('failed reset write rolls back in memory and on disk; retry can commit the switch', async t => {
+  const dir = await directory(t), store = await PrivateSessions.load(cfg, dir);
+  store.remember(session); await store.flush();
+  const saved = await readFile(store.file!, 'utf8');
+  // A directory at the temporary file path makes writeFile fail on every OS.
+  const { mkdir } = await import('node:fs/promises');
+  const temporary = `${store.file}.${process.pid}.tmp`;
+  await mkdir(temporary);
+  await assert.rejects(store.reset('user-A', 'reset-A'), /无法保存/);
+  assert.deepEqual(store.get('user-A'), session);
+  assert.equal(store.hasReset('reset-A'), false);
+  assert.equal(await readFile(store.file!, 'utf8'), saved);
+  const { rmdir } = await import('node:fs/promises');
+  await rmdir(temporary);
+  await store.reset('user-A', 'reset-A');
+  assert.equal((await PrivateSessions.load(cfg, dir)).get('user-A'), undefined);
+});
+
+test('version 1 private session files remain readable and migrate on the next write', async t => {
+  const dir = await directory(t), store = await PrivateSessions.load(cfg, dir);
+  store.remember(session); await store.flush();
+  const data = JSON.parse(await readFile(store.file!, 'utf8'));
+  await writeFile(store.file!, JSON.stringify({ version: 1, scope: data.scope, sessions: data.sessions }));
+  const restored = await PrivateSessions.load(cfg, dir);
+  assert.deepEqual(restored.get('user-A'), session);
+  await restored.reset('user-A', 'reset-A');
+  assert.equal(JSON.parse(await readFile(store.file!, 'utf8')).version, 2);
+});

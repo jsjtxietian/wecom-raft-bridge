@@ -32,7 +32,7 @@ export class Bridge {
   constructor(readonly cfg: Config, readonly raft: RaftPort, readonly wecom: WecomPort,
     readonly delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
     readonly privateSessions = new PrivateSessions()) {
-    for (const session of privateSessions.all()) {
+    for (const session of privateSessions.routes()) {
       if (cfg.allowPrivate) this.pendingRoutes.set(session.rootMessageId, { type: 'single', id: session.userId });
     }
   }
@@ -55,9 +55,29 @@ export class Bridge {
       senderId: m.from.userid, hasQuote: Boolean(m.quote) });
     const work = this.queue.then(async () => {
       const sourceId = `${this.cfg.botId}:${key}`;
+      // Commands are exact, standalone messages; quotes and prose remain ordinary tasks.
+      if (!m.quote && (content.toLowerCase() === '/new' || content === '新话题')) {
+        if (conversation.type === 'group') {
+          this.inbound.add(key);
+          await this.notice(frame, '群聊每条提问都会新建话题，直接 @机器人 发送任务即可。');
+          return;
+        }
+        if (this.privateSessions.hasReset(sourceId)) { this.inbound.add(key); return; }
+        try { await this.privateSessions.reset(conversation.id, sourceId); }
+        catch (error) {
+          log('private_session_reset_failed', { messageId: m.msgid, kind: errorKind(error) });
+          await this.notice(frame, '新话题未能保存，请稍后重试；原会话保持不变。');
+          return;
+        }
+        this.inbound.add(key);
+        log('private_session_reset', { messageId: m.msgid, senderId: m.from.userid });
+        await this.notice(frame, '已切换新话题，请发送新的任务。');
+        return;
+      }
       // Look up inside the queue so simultaneous first messages cannot create two sessions.
       const session = conversation.type === 'single' ? this.privateSessions.get(conversation.id) : undefined;
       if (conversation.type === 'single') {
+        if (this.privateSessions.hasFirstSource(sourceId)) { this.inbound.add(key); return; }
         try {
           await this.privateSessions.flush();
           if (session) {
@@ -69,8 +89,6 @@ export class Bridge {
           await this.notice(frame, '暂时无法恢复原有会话，请稍后重试。');
           return;
         }
-        // A replay of the very first callback must not be re-sent into its own thread.
-        if (session?.firstSourceId === sourceId) { this.inbound.add(key); return; }
       }
       let raftId: string | undefined;
       const body = `${this.cfg.targetAgent}\n\n${task}`;
