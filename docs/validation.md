@@ -67,5 +67,5 @@
 - `/new` 和“新话题”只在私聊独立正文中执行；先落盘再确认，下一条任务创建新根线程，其他用户及旧任务回传保留。version 1 映射兼容读取，version 2 保存当前路由、有限旧路由和重开去重标识。
 - TypeScript 检查及 41 项测试通过，新增覆盖并发重开、用户隔离、旧线程回传、引用/普通正文不误触发、磁盘写入失败回滚、重启及命令重放；使用真实本地子进程验证后台启动、重复启动、查询和停止，包含中文及空格路径、残留 PID 文件、过期停止凭据和端口被其他程序占用。
 - Windows 实机与 Git Bash 的脚本检查通过；香港时间 12:20 将旧后台进程切换至新入口，真实 Raft 身份检查、两条既有私聊路由加载及企微认证成功。重复调用 Windows 启动脚本保持同一 PID，`npm run stop` 出现 `bridge_stopped` 并正常退出，再次启动认证成功。
-- 配置 GitHub Actions 在 Windows、macOS、Linux 的 Node.js 22 下运行检查及脚本 smoke test；macOS/Linux 原生执行尚待 CI，不能用 Windows 上的 Git Bash 结果代替。
+- 提交 `766a5ca` 的 [GitHub Actions 验证](https://github.com/jsjtxietian/wecom-raft-bridge/actions/runs/41580286094)已全部通过：Windows、macOS、Linux 均在 Node.js 22 下完成依赖安装、类型检查、41 项测试及对应启动脚本的状态查询。后台进程测试使用 mock worker，不连接真实企微或 Raft；真实认证及消息往返验证仍来自本机 Windows。
 - 香港时间 12:21:42 收到真实私聊重开命令并保存切换；12:21:59 的下一条任务创建了与此前不同的 Raft 根消息，12:22:00 建立新 thread 路由，12:22:24 收到企微回传成功回执。用户确认话题已切换，私聊 `/new` 的真实往返验证完成。
