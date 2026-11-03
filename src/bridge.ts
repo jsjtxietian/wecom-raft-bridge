@@ -1,6 +1,7 @@
 import type { RaftEvent } from '@botiverse/raft-sdk';
 import type { Config } from './config.js';
 import type { RaftPort } from './raft.js';
+import { PrivateSessions } from './private-sessions.js';
 import { cleanText, withQuote, splitText, conversationOf, type Conversation, type TextFrame, type WecomPort } from './wecom.js';
 import { errorKind, log } from './log.js';
 
@@ -29,7 +30,12 @@ export class Bridge {
   private since?: number;
   readonly startedAt = Date.now();
   constructor(readonly cfg: Config, readonly raft: RaftPort, readonly wecom: WecomPort,
-    readonly delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))) {}
+    readonly delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+    readonly privateSessions = new PrivateSessions()) {
+    for (const session of privateSessions.all()) {
+      if (cfg.allowPrivate) this.pendingRoutes.set(session.rootMessageId, { type: 'single', id: session.userId });
+    }
+  }
 
   accept(frame: TextFrame): Promise<void> {
     const m = frame.body;
@@ -48,10 +54,28 @@ export class Bridge {
     log('wecom_received', { messageId: m.msgid, chatType: conversation.type, chatId: conversation.id,
       senderId: m.from.userid, hasQuote: Boolean(m.quote) });
     const work = this.queue.then(async () => {
+      const sourceId = `${this.cfg.botId}:${key}`;
+      // Look up inside the queue so simultaneous first messages cannot create two sessions.
+      const session = conversation.type === 'single' ? this.privateSessions.get(conversation.id) : undefined;
+      if (conversation.type === 'single') {
+        try {
+          await this.privateSessions.flush();
+          if (session) {
+            this.pendingRoutes.set(session.rootMessageId, conversation);
+            await this.connectRoute(session.rootMessageId, conversation);
+          }
+        } catch (error) {
+          log('private_session_unavailable', { messageId: m.msgid, kind: errorKind(error) });
+          await this.notice(frame, '暂时无法恢复原有会话，请稍后重试。');
+          return;
+        }
+        // A replay of the very first callback must not be re-sent into its own thread.
+        if (session?.firstSourceId === sourceId) { this.inbound.add(key); return; }
+      }
       let raftId: string | undefined;
       const body = `${this.cfg.targetAgent}\n\n${task}`;
       for (let attempt = 1; attempt <= 3; attempt++) {
-        try { raftId = await this.raft.send(body, `${this.cfg.botId}:${key}`); break; }
+        try { raftId = await this.raft.send(body, sourceId, session?.rootMessageId); break; }
         catch (error) {
           log('raft_send_failed', { messageId: m.msgid, attempt, kind: errorKind(error) });
           if (attempt < 3) await this.delay(attempt * 1000);
@@ -59,16 +83,25 @@ export class Bridge {
       }
       if (raftId) {
         this.inbound.add(key);
-        this.pendingRoutes.set(raftId, conversation);
+        const rootMessageId = session?.rootMessageId ?? raftId;
+        this.pendingRoutes.set(rootMessageId, conversation);
         log('raft_posted', { sourceMessageId: m.msgid, raftMessageId: raftId, chatType: conversation.type,
-          chatId: conversation.id, senderId: m.from.userid });
+          raftRootMessageId: rootMessageId, chatId: conversation.id, senderId: m.from.userid });
+        if (conversation.type === 'single' && !session) {
+          this.privateSessions.remember({ userId: conversation.id, rootMessageId, firstSourceId: sourceId });
+          try { await this.privateSessions.flush(); }
+          catch (error) {
+            log('private_session_save_failed', { raftMessageId: raftId, kind: errorKind(error) });
+            await this.notice(frame, '任务已提交，但会话记录保存异常，请联系维护者检查。');
+            return;
+          }
+        }
         // Register immediately, then let polling retry a failed follow/resolve separately.
-        await this.connectRoute(raftId, conversation).catch(() => {});
+        if (!session) await this.connectRoute(rootMessageId, conversation).catch(() => {});
+        else this.pendingRoutes.delete(rootMessageId);
       }
       // Successful submission stays silent; agent replies arrive through poll().
-      if (!raftId) await this.wecom.acknowledge(frame,
-        '暂时无法确认投递结果，请在 Raft 频道查看是否收到任务，避免重复提交。')
-        .catch(error => log('wecom_notice_failed', { messageId: m.msgid, kind: errorKind(error) }));
+      if (!raftId) await this.notice(frame, '暂时无法确认投递结果，请在 Raft 频道查看是否收到任务，避免重复提交。');
     }).finally(() => { this.inFlight.delete(key); });
     this.inFlight.set(key, work);
     this.queue = work.catch(error => log('inbound_failed', { kind: errorKind(error) }));
@@ -77,6 +110,11 @@ export class Bridge {
 
   private enabled(conversation: Conversation) {
     return conversation.type === 'single' ? this.cfg.allowPrivate : this.cfg.allowGroup;
+  }
+
+  private notice(frame: TextFrame, text: string) {
+    return this.wecom.acknowledge(frame, text)
+      .catch(error => log('wecom_notice_failed', { messageId: frame.body?.msgid, kind: errorKind(error) }));
   }
 
   poll(): Promise<boolean> {
@@ -104,6 +142,7 @@ export class Bridge {
   }
 
   private async pollReplies(): Promise<boolean> {
+    await this.privateSessions.flush();
     // Resolve/follow failures retry here without reposting the accepted task or consuming replies.
     for (const [messageId, conversation] of this.pendingRoutes) {
       await this.connectRoute(messageId, conversation);

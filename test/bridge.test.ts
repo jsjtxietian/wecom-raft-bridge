@@ -5,6 +5,7 @@ import { Bridge, belongsToChannel } from '../src/bridge.js';
 import type { Config } from '../src/config.js';
 import { cleanText, withQuote, splitText, type TextFrame, type WecomPort } from '../src/wecom.js';
 import type { RaftPort } from '../src/raft.js';
+import { PrivateSessions } from '../src/private-sessions.js';
 
 const cfg: Config = { botId: 'bot-id', secret: 'test-secret', botName: '桥接机器人', allowPrivate: true, allowGroup: true,
   serverUrl: 'https://example.test', credential: 'sk_agent_test', channel: '#StoryLoom_Wecom',
@@ -18,18 +19,20 @@ const event = (overrides: Partial<RaftEvent> = {}): RaftEvent => ({ type: 'messa
   timestamp: new Date(Date.now() + 1000).toISOString(), senderType: 'agent', senderName: 'Sol',
   content: '任务完成', channelId: 'thread-raft-1', channelName: 'opaque-thread-name', channelType: 'thread',
   parentChannelName: 'StoryLoom_Wecom', parentChannelType: 'channel', attachments: [], ...overrides });
-function setup(events: RaftEvent[] = [], config: Partial<Config> = {}) {
-  const calls: string[] = [], cursors: (number | undefined)[] = [], posts: { body: string; key: string }[] = [];
+function setup(events: RaftEvent[] = [], config: Partial<Config> = {}, sessions = new PrivateSessions()) {
+  const calls: string[] = [], cursors: (number | undefined)[] = [];
+  const posts: { body: string; key: string; rootMessageId?: string }[] = [];
   const sent: { chatId: string; text: string }[] = [];
   const raft: RaftPort = {
-    async send(body, key) { calls.push('raft'); posts.push({ body, key }); return `raft-${posts.length}`; },
+    async send(body, key, rootMessageId) { calls.push('raft'); posts.push({ body, key, rootMessageId }); return `raft-${posts.length}`; },
     async ensureThread(messageId) { return `thread-${messageId}`; },
     async receive(cursor) { cursors.push(cursor); return { events, lastSeenSeq: 42, ackMode: 'cursor', hasMore: false,
       lastSeenMessageId: null, replyTarget: null } satisfies RaftEventsReceiveData; },
   };
   const wecom: WecomPort = { async acknowledge(_frame, text) { calls.push(text); },
     async send(chatId, text) { calls.push(text); sent.push({ chatId, text }); } };
-  return { calls, posts, cursors, sent, raft, wecom, bridge: new Bridge({ ...cfg, ...config }, raft, wecom, async () => {}) };
+  return { calls, posts, cursors, sent, raft, wecom, sessions,
+    bridge: new Bridge({ ...cfg, ...config }, raft, wecom, async () => {}, sessions) };
 }
 
 test('only strips configured leading bot mention and preserves task text', () => {
@@ -207,4 +210,86 @@ test('a fresh bridge never guesses a destination for previous or untracked tasks
   await s.bridge.poll(); await s.bridge.poll();
   assert.deepEqual(s.sent, []);
   assert.deepEqual(s.cursors, [undefined, 42]);
+});
+
+const privateFrame = (id: string, userId = 'user-A') => frame(id, {
+  chattype: 'single', chatid: undefined, from: { userid: userId },
+});
+
+test('private follow-ups reuse their own root; group messages remain independent', async () => {
+  const s = setup([event(), event({ messageId: 'reply-B', channelId: 'thread-raft-2' })]);
+  await s.bridge.accept(privateFrame('A1'));
+  await s.bridge.accept(privateFrame('B1', 'user-B'));
+  await s.bridge.accept(privateFrame('A2'));
+  await s.bridge.accept(frame('group1'));
+  await s.bridge.accept(frame('group2'));
+  await s.bridge.accept(privateFrame('B2', 'user-B'));
+  const quoted = privateFrame('A3'); quoted.body!.quote = { msgtype: 'text', text: { content: '补充背景' } };
+  await s.bridge.accept(quoted);
+  assert.deepEqual(s.posts.map(p => p.rootMessageId), [undefined, undefined, 'raft-1', undefined, undefined, 'raft-2', 'raft-1']);
+  assert.ok(s.posts[6]!.body.includes('> 补充背景'));
+  assert.ok(s.posts.every(p => p.body.startsWith('@Sol\n\n')));
+  await s.bridge.poll();
+  assert.deepEqual(s.sent.map(p => p.chatId), ['user-A', 'user-B']);
+});
+
+test('simultaneous first private messages create just one root and keep per-message deduplication', async () => {
+  const s = setup();
+  await Promise.all([s.bridge.accept(privateFrame('first')), s.bridge.accept(privateFrame('second')),
+    s.bridge.accept(privateFrame('first'))]);
+  assert.deepEqual(s.posts.map(p => p.rootMessageId), [undefined, 'raft-1']);
+  assert.equal(s.sessions.all().length, 1);
+});
+
+test('restored sessions route new replies and follow-ups; the first callback is not reposted', async () => {
+  const sessions = new PrivateSessions();
+  sessions.remember({ userId: 'user-A', rootMessageId: 'old-root', firstSourceId: 'bot-id:single:user-A:first' });
+  const s = setup([event({ channelId: 'thread-old-root' })], {}, sessions);
+  await s.bridge.poll();
+  assert.deepEqual(s.sent, [{ chatId: 'user-A', text: '[Sol] 任务完成' }]);
+  await s.bridge.accept(privateFrame('first'));
+  assert.equal(s.posts.length, 0);
+  await s.bridge.accept(privateFrame('follow-up'));
+  assert.equal(s.posts[0]!.rootMessageId, 'old-root');
+});
+
+test('an unavailable private thread never silently switches to a new root', async () => {
+  const s = setup();
+  await s.bridge.accept(privateFrame('first'));
+  const ensureThread = s.raft.ensureThread;
+  s.raft.ensureThread = async () => { throw new Error('missing thread'); };
+  await s.bridge.accept(privateFrame('follow-up'));
+  assert.equal(s.posts.length, 1);
+  assert.ok(s.calls.includes('暂时无法恢复原有会话，请稍后重试。'));
+  s.raft.ensureThread = ensureThread;
+  await s.bridge.accept(privateFrame('follow-up'));
+  assert.equal(s.posts[1]!.rootMessageId, 'raft-1');
+});
+
+test('private follow-up send retries keep the same destination and idempotency key', async () => {
+  const s = setup();
+  await s.bridge.accept(privateFrame('first'));
+  const attempts: { key: string; root?: string }[] = [];
+  s.raft.send = async (_body, key, root) => { attempts.push({ key, root }); throw new Error('timeout'); };
+  await s.bridge.accept(privateFrame('follow-up'));
+  assert.equal(attempts.length, 3);
+  assert.equal(new Set(attempts.map(a => a.key)).size, 1);
+  assert.ok(attempts.every(a => a.root === 'raft-1'));
+  assert.equal(s.sessions.get('user-A')!.rootMessageId, 'raft-1');
+});
+
+test('failed session persistence blocks continuation until saved, without reposting the accepted root', async () => {
+  const s = setup([event()]);
+  const flush = s.sessions.flush.bind(s.sessions);
+  s.sessions.flush = async () => { if (s.sessions.all().length) throw new Error('disk full'); };
+  await s.bridge.accept(privateFrame('first'));
+  await s.bridge.accept(privateFrame('second'));
+  await assert.rejects(s.bridge.poll());
+  assert.equal(s.posts.length, 1);
+  assert.equal(s.cursors.length, 0);
+  s.sessions.flush = flush;
+  await s.bridge.poll();
+  await s.bridge.accept(privateFrame('second'));
+  assert.equal(s.posts[1]!.rootMessageId, 'raft-1');
+  assert.deepEqual(s.sent, [{ chatId: 'user-A', text: '[Sol] 任务完成' }]);
 });

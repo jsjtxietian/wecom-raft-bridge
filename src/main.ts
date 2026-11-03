@@ -3,6 +3,7 @@ import { hideSecrets, log, errorKind } from './log.js';
 import { createWecom, conversationOf } from './wecom.js';
 import { RaftConnection } from './raft.js';
 import { Bridge } from './bridge.js';
+import { PrivateSessions } from './private-sessions.js';
 
 async function main() {
   const mode = process.argv[2] || 'run';
@@ -12,8 +13,10 @@ async function main() {
   const raft = mode === 'discover' ? undefined : new RaftConnection(cfg);
   if (raft) await raft.check();
   if (mode === 'check') return;
+  const sessions = mode === 'run' ? await PrivateSessions.load(cfg) : undefined;
+  if (sessions) log('private_sessions_loaded', { count: sessions.all().length });
   const { client, port } = createWecom(cfg);
-  const bridge = mode === 'run' ? new Bridge(cfg, raft!, port) : undefined;
+  const bridge = mode === 'run' ? new Bridge(cfg, raft!, port, undefined, sessions) : undefined;
   if (bridge) log('bridge_modes', { allowPrivate: cfg.allowPrivate, allowGroup: cfg.allowGroup });
   let stopping = false, timer: ReturnType<typeof setTimeout> | undefined;
   let polling: Promise<void> = Promise.resolve();

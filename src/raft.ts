@@ -4,7 +4,7 @@ import type { Config } from './config.js';
 import { log, BridgeError } from './log.js';
 
 export interface RaftPort {
-  send(content: string, sourceId: string): Promise<string>;
+  send(content: string, sourceId: string, rootMessageId?: string): Promise<string>;
   ensureThread(messageId: string): Promise<string>;
   receive(since?: number): Promise<RaftEventsReceiveData>;
 }
@@ -35,8 +35,9 @@ export class RaftConnection implements RaftPort {
     log('raft_ready', { agent: this.agentName, channel: this.cfg.channel, targetAgent: this.cfg.targetAgent,
       members: members.data.agents.map(a => ({ name: a.name, status: a.status })) });
   }
-  async send(content: string, sourceId: string): Promise<string> {
-    const result = await this.client.messages.send({ target: this.cfg.channel, content,
+  async send(content: string, sourceId: string, rootMessageId?: string): Promise<string> {
+    const target = rootMessageId ? `${this.cfg.channel}:${rootMessageId.slice(0, 8)}` : this.cfg.channel;
+    const result = await this.client.messages.send({ target, content,
       idempotencyKey: `wecom:${createHash('sha256').update(sourceId).digest('hex')}` });
     if (!result.ok) throw new BridgeError(`Raft send refused (${result.status ?? result.error.kind})`);
     if (result.data.state !== 'sent' || !result.data.messageId) throw new BridgeError(`Raft send not confirmed (${result.data.state})`);

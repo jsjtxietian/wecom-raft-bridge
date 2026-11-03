@@ -23,9 +23,19 @@
 
 企微 SDK `BaseMessage` 声明 `chatid` 仅群聊返回；`sendMessage(chatid, body)` 文档规定：私聊填 `from.userid`，群聊填 `chatid`。`WECOM_ALLOW_PRIVATE` 与 `WECOM_ALLOW_GROUP` 独立控制是否接收对应会话，均默认开启。移除固定群 ID 校验，访问范围由企微侧控制；Bot ID 校验仍保留。
 
-每条来源消息仍按 `@目标agent` 加原文发到固定 Raft 频道。发送成功后先保存来源会话，再 `threads.follow(#频道:消息ID前8位)`，用 `channels.resolve` 获取线程 channel ID。该解析方式已在本机现有线程上与 `threads.list` 返回的 `threadChannelId` 交叉核对。`RaftEvent` 没有父消息 ID 字段，因此使用其 `channelId` 精确匹配线程路由，不解析频道名、不使用批次的 `replyTarget` 猜测单条消息归属。
+群聊每次提问及首次私聊按 `@目标agent` 加正文发到固定 Raft 频道。发送成功后先保存来源会话，再 `threads.follow(#频道:消息ID前8位)`，用 `channels.resolve` 获取线程 channel ID。该解析方式已在本机现有线程上与 `threads.list` 返回的 `threadChannelId` 交叉核对。`RaftEvent` 没有父消息 ID 字段，因此使用其 `channelId` 精确匹配线程路由，不解析频道名、不使用批次的 `replyTarget` 猜测单条消息归属。
 
-路由只在内存保存，最多 10,000 条。发送及轮询共用串行队列，避免快速回复先于路由注册被消费。线程关注/解析失败会在轮询时重试，不重新发送已确认的任务，未完成路由注册时不消费 inbox。只外发来源已知的线程回复；根频道、未知线程、缺少 channel ID 的消息记录 `raft_reply_unrouted` 并跳过。关闭某会话类型也会停止该类型的回传。重启后路由丢失，旧任务的后续回复不会回传。
+回传路由在内存最多保存 10,000 条。发送及轮询共用串行队列，避免快速回复先于路由注册被消费。线程关注/解析失败会在轮询时重试，不重新发送已确认的任务，未完成路由注册时不消费 inbox。只外发来源已知的线程回复；根频道、未知线程、缺少 channel ID 的消息记录 `raft_reply_unrouted` 并跳过。关闭某会话类型也会停止该类型的回传。重启时恢复持久化的私聊映射，群聊映射不恢复。
+
+## 私聊固定线程
+
+参考飞书 `handler.ts` 中“首次发送建立根消息，后续向 `existing.raftThreadTarget` 发送”的方式，按企微 `from.userid` 复用线程。飞书参考项目本身忽略私聊；这里独立实现企微私聊适配，不复制其卡片、历史同步或用户规则。会话查找在串行队列内进行，避免并发的第一、第二条消息各自创建根线程。
+
+`PrivateSessions` 把用户 ID、根消息 ID、第一条来源消息标识写入 `.local/private-sessions/<scope>.json`。scope 是 Bot ID、Raft 地址、频道、桥接 handle、执行 handle 的哈希，不包含 token。写入使用临时文件、flush 和原子 rename；保存失败时保留内存映射并重试，恢复前暂停私聊后续提交和 inbox 消费。损坏文件、重复用户或跨用户线程冲突会阻止启动，原文件不覆盖。
+
+后续消息调用 `messages.send`，其 `target` 为固定根消息的 `#channel:shortid`。首条回调重放时通过保存的来源标识识别，不把相同消息再发到它自己的 thread；其他重试保持原目标和幂等键。线程无法关注或解析时提示用户，绝不自动回退到频道创建新会话。没有超时或自动切换话题；上下文由 Raft agent 读取。
+
+本次只持久化私聊映射，不实现完整 journal、停机期间补发或群聊恢复。外部发送成功但私聊映射尚未落盘时仍存在崩溃窗口；原消息再次投递可依赖稳定幂等键恢复根消息，但不能据此承诺任意崩溃场景都不丢状态。
 
 企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`，正常提交不调用 `replyStream`，不发送提交确认或创建空的回复流。投递失败、空任务和队列已满时，才通过 `replyStream` 和原始 `req_id` 回复提示并结束该流。agent 回复通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。是否只发送最终结论由 Raft agent 的频道约定决定，桥接不按文本猜测或过滤进度消息。
 
@@ -33,7 +43,7 @@
 
 企微[接收消息协议](https://developer.work.weixin.qq.com/document/path/100719)和 SDK `QuoteContent` 定义了 `quote.text.content` 等引用内容字段；长连接文档说明消息体结构沿用该协议。桥接从当前 `message.text` 回调读取 `quote`，提取文本或图文混排中的文字，以 Markdown 引用块与本次问题分开呈现。空引用及未接入的媒体引用用简短占位说明，不把资源 URL 当作正文或下载资源。
 
-引用中的 ASCII agent mention 使用全角 `＠` 展示，避免历史提及再次唤醒 agent；本次问题的 mention 和邮箱保持原样。引用前后仍是一条独立 Raft 任务，回传依据本次来源会话；不凭引用文字猜测旧任务 ID。日志仅增加 `hasQuote` 标记，不记录引用正文。
+引用中的 ASCII agent mention 使用全角 `＠` 展示，避免历史提及再次唤醒 agent；本次问题的 mention 和邮箱保持原样。引用不改变路由：私聊使用固定线程，群聊独立发起任务；不凭引用文字猜测旧任务 ID。日志仅增加 `hasQuote` 标记，不记录引用正文。
 
 本次只使用长连接消息回调携带的引用内容。其他 MCP 可能提供历史读取能力，未在此项目核实或接入；不据当前长连接接口的字段推断整个企微平台没有历史能力。
 
@@ -48,6 +58,8 @@
 | `raft_ready` | 身份、频道和执行 agent 检查通过 |
 | `wecom_authenticated` | 企微长连接认证成功 |
 | `bridge_modes` | 当前私聊/群聊开关 |
+| `private_sessions_loaded` | 启动时加载的私聊会话数 |
+| `private_session_unavailable` / `private_session_save_failed` | 原私聊无法恢复 / 已提交但映射保存失败 |
 | `wecom_conversation_discovered` | 排错模式下收到的私聊/群聊元数据 |
 | `wecom_received` / `raft_posted` | 收到企微消息 / Raft 已确认发送 |
 | `raft_mention_delivery` | mention 投递状态；`pending` 尚未确认，`delivered` 已投递 |
