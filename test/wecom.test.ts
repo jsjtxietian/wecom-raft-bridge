@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { WebSocketServer } from 'ws';
-import { createWecom, conversationOf, withQuote, type TextFrame } from '../src/wecom.js';
+import { createWecom, conversationOf, withQuote, messageContent, type TextFrame, type MessageFrame } from '../src/wecom.js';
 import type { Config } from '../src/config.js';
 
 for (const chatType of ['group', 'single'] as const) test(`official SDK receives ${chatType} and sends to its group/user id`, async () => {
@@ -39,6 +39,38 @@ for (const chatType of ['group', 'single'] as const) test(`official SDK receives
     const push = frames.find(f => f.cmd === 'aibot_send_msg')!;
     assert.equal(push.body.chatid, destination);
     assert.equal(push.body.markdown.content, '[Sol] hello');
+  } finally {
+    client.disconnect();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+for (const type of ['image', 'mixed'] as const) test(`official SDK emits private ${type} callback with per-image keys intact`, async () => {
+  const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await once(server, 'listening');
+  const address = server.address(); assert.ok(typeof address === 'object' && address);
+  const image = { url: 'https://wework.qpic.cn/test', aeskey: 'per-image-key' };
+  server.on('connection', socket => socket.on('message', raw => {
+    const command = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({ headers: command.headers, errcode: 0, errmsg: 'ok' }));
+    if (command.cmd === 'aibot_subscribe') socket.send(JSON.stringify({ cmd: 'aibot_msg_callback',
+      headers: { req_id: 'image-request' }, body: { msgid: 'image-message', aibotid: 'bot-1',
+        chattype: 'single', from: { userid: 'person-1' }, msgtype: type,
+        ...(type === 'image' ? { image } : { mixed: { msg_item: [
+          { msgtype: 'text', text: { content: '图片里是什么？' } }, { msgtype: 'image', image },
+        ] } }) } }));
+  }));
+  const { client, port } = createWecom({ botId: 'bot-1', secret: 'fake-secret' } as Config, `ws://127.0.0.1:${address.port}`);
+  try {
+    const received = new Promise<MessageFrame>(resolve => client.once(`message.${type}`, resolve));
+    client.connect();
+    const frame = await received;
+    const parsed = messageContent(frame, 'bot-1', '')!;
+    assert.deepEqual(parsed.images, [image]);
+    assert.equal(parsed.task, type === 'image' ? '请查看图片，并结合当前对话回答。' : '图片里是什么？');
+    assert.deepEqual(conversationOf(frame), { type: 'single', id: 'person-1' });
+    await port.acknowledge(frame, '图片测试反馈');
   } finally {
     client.disconnect();
     for (const socket of server.clients) socket.terminate();

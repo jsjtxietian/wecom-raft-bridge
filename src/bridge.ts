@@ -2,7 +2,8 @@ import type { RaftEvent } from '@botiverse/raft-sdk';
 import type { Config } from './config.js';
 import type { RaftPort } from './raft.js';
 import { PrivateSessions } from './private-sessions.js';
-import { cleanText, withQuote, splitText, conversationOf, type Conversation, type TextFrame, type WecomPort } from './wecom.js';
+import { messageContent, splitText, conversationOf, type Conversation, type MessageFrame, type WecomPort } from './wecom.js';
+import { ImageTransferError, MAX_MESSAGE_IMAGE_BYTES } from './images.js';
 import { errorKind, log } from './log.js';
 
 export function belongsToChannel(event: RaftEvent, channel: string): boolean {
@@ -24,6 +25,7 @@ export class Bridge {
   private inbound = new RecentIds();
   private inFlight = new Map<string, Promise<void>>();
   private sentParts = new RecentIds();
+  private preparedImages = new Map<string, { root?: string; ids: string[]; bytes: number; sendAttempted: boolean }>();
   private pendingRoutes = new Map<string, Conversation>();
   private routes = new Map<string, Conversation>();
   private queue: Promise<void> = Promise.resolve();
@@ -37,26 +39,29 @@ export class Bridge {
     }
   }
 
-  accept(frame: TextFrame): Promise<void> {
+  accept(frame: MessageFrame): Promise<void> {
     const m = frame.body;
-    if (!m || m.msgtype !== 'text' || m.aibotid !== this.cfg.botId) return Promise.resolve();
-    if (!m.msgid || !m.from?.userid || typeof m.text?.content !== 'string') return Promise.resolve();
+    if (!m || !['text', 'image', 'mixed'].includes(m.msgtype) || m.aibotid !== this.cfg.botId) return Promise.resolve();
+    if (!m.msgid || !m.from?.userid) return Promise.resolve();
     const conversation = conversationOf(frame);
     if (!conversation || !this.enabled(conversation)) return Promise.resolve();
     const key = `${conversation.type}:${conversation.id}:${m.msgid}`;
     if (this.inbound.has(key)) return Promise.resolve();
     const existing = this.inFlight.get(key);
     if (existing) return existing;
-    const content = cleanText(m.text.content, this.cfg.botId, this.cfg.botName);
+    let parsed: ReturnType<typeof messageContent>;
+    try { parsed = messageContent(frame, this.cfg.botId, this.cfg.botName); }
+    catch (error) { return this.notice(frame, error instanceof ImageTransferError ? error.message : '消息无法读取，请重新发送。'); }
+    if (!parsed) return Promise.resolve();
+    const { content, task, images } = parsed;
     if (!content) return this.wecom.acknowledge(frame, '请输入任务内容。');
     if (this.inFlight.size + this.pendingRoutes.size >= 100) return this.wecom.acknowledge(frame, '当前队列已满，请稍后重试。');
-    const task = withQuote(content, m.quote);
     log('wecom_received', { messageId: m.msgid, chatType: conversation.type, chatId: conversation.id,
-      senderId: m.from.userid, hasQuote: Boolean(m.quote) });
+      senderId: m.from.userid, hasQuote: Boolean(m.quote), imageCount: images.length });
     const work = this.queue.then(async () => {
       const sourceId = `${this.cfg.botId}:${key}`;
       // Commands are exact, standalone messages; quotes and prose remain ordinary tasks.
-      if (!m.quote && (content.toLowerCase() === '/new' || content === '新话题')) {
+      if (m.msgtype === 'text' && !m.quote && !images.length && (content.toLowerCase() === '/new' || content === '新话题')) {
         if (conversation.type === 'group') {
           this.inbound.add(key);
           await this.notice(frame, '群聊每条提问都会新建话题，直接 @机器人 发送任务即可。');
@@ -90,10 +95,40 @@ export class Bridge {
           return;
         }
       }
+      let attachmentIds: string[] = [];
+      if (images.length) {
+        try {
+          let prepared = this.preparedImages.get(key);
+          if (!prepared) {
+            prepared = { root: session?.rootMessageId, ids: [], bytes: 0, sendAttempted: false };
+            this.preparedImages.set(key, prepared);
+            if (this.preparedImages.size > 100) this.preparedImages.delete(this.preparedImages.keys().next().value!);
+          }
+          if (prepared.root !== session?.rootMessageId) throw new ImageTransferError('这条图片所属的话题已切换，请重新发送图片。');
+          for (let i = prepared.ids.length; i < images.length; i++) {
+            const image = await this.wecom.downloadImage(images[i]!, i);
+            if (prepared.bytes + image.bytes.length > MAX_MESSAGE_IMAGE_BYTES) {
+              throw new ImageTransferError('一条消息的图片总大小不能超过 20 MiB，请分开发送。');
+            }
+            const id = await this.raft.uploadImage(image, prepared.root);
+            prepared.ids.push(id); prepared.bytes += image.bytes.length;
+            log('raft_image_uploaded', { messageId: m.msgid, attachmentId: id, imageNumber: i + 1, bytes: image.bytes.length });
+          }
+          attachmentIds = prepared.ids;
+        } catch (error) {
+          log('image_transfer_failed', { messageId: m.msgid, kind: errorKind(error) });
+          await this.notice(frame, this.preparedImages.get(key)?.sendAttempted
+            ? '这条图片任务此前投递结果尚未确认，请先在 Raft 查看，避免重复提交。'
+            : (error instanceof ImageTransferError ? error.message : '图片上传到 Raft 失败，请稍后重试。') + ' 本条任务尚未提交。');
+          return;
+        }
+      }
       let raftId: string | undefined;
       const body = `${this.cfg.targetAgent}\n\n${task}`;
+      const prepared = this.preparedImages.get(key);
+      if (prepared) prepared.sendAttempted = true;
       for (let attempt = 1; attempt <= 3; attempt++) {
-        try { raftId = await this.raft.send(body, sourceId, session?.rootMessageId); break; }
+        try { raftId = await this.raft.send(body, sourceId, session?.rootMessageId, attachmentIds); break; }
         catch (error) {
           log('raft_send_failed', { messageId: m.msgid, attempt, kind: errorKind(error) });
           if (attempt < 3) await this.delay(attempt * 1000);
@@ -101,6 +136,7 @@ export class Bridge {
       }
       if (raftId) {
         this.inbound.add(key);
+        this.preparedImages.delete(key);
         const rootMessageId = session?.rootMessageId ?? raftId;
         this.pendingRoutes.set(rootMessageId, conversation);
         log('raft_posted', { sourceMessageId: m.msgid, raftMessageId: raftId, chatType: conversation.type,
@@ -130,7 +166,7 @@ export class Bridge {
     return conversation.type === 'single' ? this.cfg.allowPrivate : this.cfg.allowGroup;
   }
 
-  private notice(frame: TextFrame, text: string) {
+  private notice(frame: MessageFrame, text: string) {
     return this.wecom.acknowledge(frame, text)
       .catch(error => log('wecom_notice_failed', { messageId: frame.body?.msgid, kind: errorKind(error) }));
   }

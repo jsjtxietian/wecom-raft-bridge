@@ -1,22 +1,27 @@
-import { createRaftClient, type RaftClient, type RaftEventsReceiveData } from '@botiverse/raft-sdk';
+import { createRaftClient, createRaft, type Raft, type RaftClient, type RaftEventsReceiveData } from '@botiverse/raft-sdk';
 import { createHash } from 'node:crypto';
 import type { Config } from './config.js';
 import { log, BridgeError } from './log.js';
+import type { ImageUpload } from './images.js';
 
 export interface RaftPort {
-  send(content: string, sourceId: string, rootMessageId?: string): Promise<string>;
+  send(content: string, sourceId: string, rootMessageId?: string, attachmentIds?: string[]): Promise<string>;
+  uploadImage(image: ImageUpload, rootMessageId?: string): Promise<string>;
   ensureThread(messageId: string): Promise<string>;
   receive(since?: number): Promise<RaftEventsReceiveData>;
 }
 
 export class RaftConnection implements RaftPort {
   readonly client: RaftClient;
+  readonly attachments: Raft['attachments'];
   agentName = '';
   channelId = '';
-  constructor(readonly cfg: Config) {
-    this.client = createRaftClient({ serverUrl: cfg.serverUrl, credential: cfg.credential,
-      fetch: (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(20_000) }),
-    });
+  constructor(readonly cfg: Config, fetcher: typeof fetch = fetch) {
+    const options = { serverUrl: cfg.serverUrl, credential: cfg.credential,
+      fetch: ((url, init) => fetcher(url, { ...init, signal: AbortSignal.timeout(20_000) })) as typeof fetch };
+    this.client = createRaftClient(options);
+    // The typed upload helper lives on createRaft; existing message/inbox behavior stays on the program client.
+    this.attachments = createRaft(options).attachments;
   }
   async check() {
     const context = await this.client.agent.context();
@@ -35,9 +40,16 @@ export class RaftConnection implements RaftPort {
     log('raft_ready', { agent: this.agentName, channel: this.cfg.channel, targetAgent: this.cfg.targetAgent,
       members: members.data.agents.map(a => ({ name: a.name, status: a.status })) });
   }
-  async send(content: string, sourceId: string, rootMessageId?: string): Promise<string> {
+  async uploadImage(image: ImageUpload, rootMessageId?: string): Promise<string> {
     const target = rootMessageId ? `${this.cfg.channel}:${rootMessageId.slice(0, 8)}` : this.cfg.channel;
-    const result = await this.client.messages.send({ target, content,
+    const result = await this.attachments.upload({ target, ...image });
+    if (!result.ok) throw new BridgeError(`Raft attachment upload failed (${result.error.code})`);
+    if (result.state !== 'uploaded' || !result.data.id) throw new BridgeError('Raft attachment upload not confirmed');
+    return result.data.id;
+  }
+  async send(content: string, sourceId: string, rootMessageId?: string, attachmentIds: string[] = []): Promise<string> {
+    const target = rootMessageId ? `${this.cfg.channel}:${rootMessageId.slice(0, 8)}` : this.cfg.channel;
+    const result = await this.client.messages.send({ target, content, ...(attachmentIds.length ? { attachmentIds } : {}),
       idempotencyKey: `wecom:${createHash('sha256').update(sourceId).digest('hex')}` });
     if (!result.ok) throw new BridgeError(`Raft send refused (${result.status ?? result.error.kind})`);
     if (result.data.state !== 'sent' || !result.data.messageId) throw new BridgeError(`Raft send not confirmed (${result.data.state})`);

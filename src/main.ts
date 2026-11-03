@@ -1,6 +1,6 @@
 import { loadConfig } from './config.js';
 import { hideSecrets, log, errorKind } from './log.js';
-import { createWecom, conversationOf } from './wecom.js';
+import { createWecom, conversationOf, type MessageFrame } from './wecom.js';
 import { RaftConnection } from './raft.js';
 import { Bridge } from './bridge.js';
 import { PrivateSessions } from './private-sessions.js';
@@ -48,16 +48,19 @@ async function main() {
         if (!stopping) timer = setTimeout(tick, more ? 100 : cfg.pollMs);
       })();
     };
-    client.on('message.text', frame => {
+    const onMessage = (frame: MessageFrame) => {
       if (stopping) return;
       if (mode === 'discover') {
         const m = frame.body;
         const conversation = conversationOf(frame);
         if (conversation && m?.aibotid === cfg.botId) log('wecom_conversation_discovered', {
-          chatType: conversation.type, chatId: conversation.id, senderId: m.from.userid, messageId: m.msgid,
+          chatType: conversation.type, chatId: conversation.id, senderId: m.from.userid, messageId: m.msgid, messageType: m.msgtype,
         });
       } else void bridge!.accept(frame).catch(error => log('message_failed', { kind: errorKind(error) }));
-    });
+    };
+    client.on('message.text', onMessage);
+    client.on('message.image', onMessage);
+    client.on('message.mixed', onMessage);
     let initialized = false;
     client.on('authenticated', () => {
       if (stopping) return;

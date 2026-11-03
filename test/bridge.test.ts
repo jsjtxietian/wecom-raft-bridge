@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import type { RaftEvent, RaftEventsReceiveData } from '@botiverse/raft-sdk';
 import { Bridge, belongsToChannel } from '../src/bridge.js';
 import type { Config } from '../src/config.js';
-import { cleanText, withQuote, splitText, type TextFrame, type WecomPort } from '../src/wecom.js';
+import { cleanText, withQuote, splitText, type TextFrame, type MessageFrame, type WecomPort } from '../src/wecom.js';
+import { ImageTransferError } from '../src/images.js';
 import type { RaftPort } from '../src/raft.js';
 import { PrivateSessions } from '../src/private-sessions.js';
 
@@ -21,17 +22,20 @@ const event = (overrides: Partial<RaftEvent> = {}): RaftEvent => ({ type: 'messa
   parentChannelName: 'StoryLoom_Wecom', parentChannelType: 'channel', attachments: [], ...overrides });
 function setup(events: RaftEvent[] = [], config: Partial<Config> = {}, sessions = new PrivateSessions()) {
   const calls: string[] = [], cursors: (number | undefined)[] = [];
-  const posts: { body: string; key: string; rootMessageId?: string }[] = [];
+  const posts: { body: string; key: string; rootMessageId?: string; attachmentIds: string[] }[] = [];
+  const uploads: { filename: string; rootMessageId?: string }[] = [];
   const sent: { chatId: string; text: string }[] = [];
   const raft: RaftPort = {
-    async send(body, key, rootMessageId) { calls.push('raft'); posts.push({ body, key, rootMessageId }); return `raft-${posts.length}`; },
+    async send(body, key, rootMessageId, attachmentIds = []) { calls.push('raft'); posts.push({ body, key, rootMessageId, attachmentIds: [...attachmentIds] }); return `raft-${posts.length}`; },
+    async uploadImage(image, rootMessageId) { uploads.push({ filename: image.filename, rootMessageId }); return `attachment-${uploads.length}`; },
     async ensureThread(messageId) { return `thread-${messageId}`; },
     async receive(cursor) { cursors.push(cursor); return { events, lastSeenSeq: 42, ackMode: 'cursor', hasMore: false,
       lastSeenMessageId: null, replyTarget: null } satisfies RaftEventsReceiveData; },
   };
   const wecom: WecomPort = { async acknowledge(_frame, text) { calls.push(text); },
+    async downloadImage(_image, index) { return { filename: `image-${index + 1}.png`, bytes: new Uint8Array([1, 2, 3]), mimeType: 'image/png' }; },
     async send(chatId, text) { calls.push(text); sent.push({ chatId, text }); } };
-  return { calls, posts, cursors, sent, raft, wecom, sessions,
+  return { calls, posts, uploads, cursors, sent, raft, wecom, sessions,
     bridge: new Bridge({ ...cfg, ...config }, raft, wecom, async () => {}, sessions) };
 }
 
@@ -107,7 +111,7 @@ test('empty or unsupported quotes preserve the question; a quote alone does not 
 test('wrong bot, missing group id and unsupported messages never enter Raft', async () => {
   const s = setup();
   for (const patch of [{ chatid: undefined }, { chattype: 'unknown' }, { aibotid: 'other' },
-    { from: { userid: '' } }, { msgtype: 'image' }]) {
+    { from: { userid: '' } }, { msgtype: 'video' }]) {
     const f = frame(); Object.assign(f.body!, patch); await s.bridge.accept(f);
   }
   assert.equal(s.calls.length, 0);
@@ -355,4 +359,77 @@ test('replayed reset and retired first messages cannot reset or resurrect a topi
   assert.equal(s.posts[0]!.rootMessageId, 'new-root');
   await s.bridge.poll();
   assert.equal(s.sent[0]!.chatId, 'user-A');
+});
+
+const imageRef = { url: 'https://wework.qpic.cn/fake-private-image', aeskey: 'fake-per-image-key' };
+function imageFrame(id: string): MessageFrame {
+  return { ...privateFrame(id), body: { ...privateFrame(id).body!, msgtype: 'image', image: imageRef } } as MessageFrame;
+}
+
+test('private image creates or reuses its own thread and returns the agent reply silently', async () => {
+  const s = setup([event()]);
+  await Promise.all([s.bridge.accept(imageFrame('image1')), s.bridge.accept(imageFrame('image1'))]);
+  await s.bridge.accept(imageFrame('image2'));
+  assert.deepEqual(s.posts.map(p => p.attachmentIds), [['attachment-1'], ['attachment-2']]);
+  assert.deepEqual(s.uploads.map(p => p.rootMessageId), [undefined, 'raft-1']);
+  assert.equal(s.posts[1]!.rootMessageId, 'raft-1');
+  assert.ok(s.posts.every(p => p.body === '@Sol\n\n请查看图片，并结合当前对话回答。'));
+  assert.ok(s.posts.every(p => !p.body.includes(imageRef.url) && !p.body.includes(imageRef.aeskey)));
+  assert.deepEqual(s.calls, ['raft', 'raft']);
+  await s.bridge.poll();
+  assert.equal(s.sent[0]!.chatId, 'user-A');
+});
+
+test('mixed and quoted images preserve order with text and remain isolated across private users and groups', async () => {
+  const s = setup();
+  const mixed = frame('mixed', { text: undefined }) as MessageFrame;
+  Object.assign(mixed.body!, { msgtype: 'mixed', mixed: { msg_item: [
+    { msgtype: 'text', text: { content: '@桥接机器人 对比这两张图' } },
+    { msgtype: 'image', image: imageRef }, { msgtype: 'text', text: { content: '和' } },
+    { msgtype: 'image', image: imageRef },
+  ] }, quote: { msgtype: 'mixed', mixed: { msg_item: [
+    { msgtype: 'text', text: { content: '@Sol 之前的说明' } }, { msgtype: 'image', image: imageRef },
+  ] } } });
+  await s.bridge.accept(mixed);
+  const quoted = privateFrame('quoted-image', 'user-B');
+  quoted.body!.quote = { msgtype: 'image', image: imageRef };
+  await s.bridge.accept(quoted);
+  assert.deepEqual(s.posts[0]!.attachmentIds, ['attachment-1', 'attachment-2', 'attachment-3']);
+  assert.equal(s.posts[0]!.body, '@Sol\n\n引用内容：\n> ＠Sol 之前的说明\n\n本次提问：\n对比这两张图\n和');
+  assert.deepEqual(s.posts[1]!.attachmentIds, ['attachment-4']);
+  assert.equal(s.posts[1]!.body, '@Sol\n\n请检查 a@b.com 和 @另一个人');
+  assert.equal(s.sessions.get('user-B')!.rootMessageId, 'raft-2');
+});
+
+test('image errors never submit incomplete questions; retries reuse confirmed uploads and send keys', async () => {
+  const s = setup();
+  const download = s.wecom.downloadImage;
+  s.wecom.downloadImage = async () => { throw new ImageTransferError('图片已过期。'); };
+  await s.bridge.accept(imageFrame('image'));
+  assert.equal(s.posts.length, 0);
+  assert.ok(s.calls.includes('图片已过期。 本条任务尚未提交。'));
+  s.wecom.downloadImage = download;
+  const send = s.raft.send, attempts: { key: string; attachments: string[] }[] = [];
+  s.raft.send = async (_body, key, _root, attachments = []) => {
+    attempts.push({ key, attachments: [...attachments] }); throw new Error('timeout');
+  };
+  await s.bridge.accept(imageFrame('image'));
+  assert.equal(s.uploads.length, 1);
+  s.raft.send = send;
+  await s.bridge.accept(imageFrame('image'));
+  assert.equal(s.uploads.length, 1);
+  assert.equal(attempts.length, 3);
+  assert.ok(attempts.every(a => a.key === s.posts[0]!.key && a.attachments[0] === s.posts[0]!.attachmentIds[0]));
+});
+
+test('image limits and disabled private messages do not download or upload media', async () => {
+  const off = setup([], { allowPrivate: false });
+  await off.bridge.accept(imageFrame('off'));
+  assert.equal(off.uploads.length, 0);
+  const s = setup();
+  const many = imageFrame('many');
+  Object.assign(many.body!, { msgtype: 'mixed', mixed: { msg_item: Array.from({ length: 5 }, () => ({ msgtype: 'image', image: imageRef })) } });
+  await s.bridge.accept(many);
+  assert.equal(s.uploads.length, 0); assert.equal(s.posts.length, 0);
+  assert.ok(s.calls[0]!.includes('最多支持 4 张'));
 });

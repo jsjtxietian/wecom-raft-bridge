@@ -13,6 +13,7 @@
 | `createRaftClient` / `agent.context` | 使用 External Agent 凭据建立客户端、核对身份和权限 |
 | `routes.channels.members/resolve` | 确认频道成员，解析频道和请求线程的真实 channel ID |
 | `messages.send` | 携带稳定幂等键发送文本，仅 `state=sent` 视为确认成功 |
+| `createRaft(...).attachments.upload` | 按会话上传图片字节，取得附件 ID，再通过原 `messages.send` 的 `attachmentIds` 关联到消息 |
 | `routes.threads.follow` | 关注新请求对应的线程 |
 | `routes.mentions.senderDeliveries` | 查看 mention 是否投递给 agent |
 | `events.receive` | 按 `ack: 'cursor'` 拉取 inbox，回传成功后推进游标 |
@@ -41,7 +42,7 @@
 
 本次只持久化私聊映射，不实现完整 journal、停机期间补发或群聊恢复。外部发送成功但私聊映射尚未落盘时仍存在崩溃窗口；原消息再次投递可依赖稳定幂等键恢复根消息，但不能据此承诺任意崩溃场景都不丢状态。
 
-企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`，正常任务提交不调用 `replyStream`，不发送提交确认或创建空的回复流。投递失败、空任务、队列已满和重开命令的反馈，通过 `replyStream` 和原始 `req_id` 回复提示并结束该流。agent 回复通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。是否只发送最终结论由 Raft agent 的频道约定决定，桥接不按文本猜测或过滤进度消息。
+企微使用 `@wecom/aibot-node-sdk@1.0.7`：订阅 `message.text`、`message.image`、`message.mixed`，正常任务提交不调用 `replyStream`，不发送提交确认或创建空的回复流。投递失败、空任务、队列已满和重开命令的反馈，通过 `replyStream` 和原始 `req_id` 回复提示并结束该流。agent 回复通过 `sendMessage` 主动回群，检查发送回执。主动推送用 SDK 支持的 `markdown` 载荷展示文本，不使用卡片或附件。是否只发送最终结论由 Raft agent 的频道约定决定，桥接不按文本猜测或过滤进度消息。
 
 ## 跨平台启动管理
 
@@ -55,15 +56,27 @@
 
 ## 引用提问
 
-企微[接收消息协议](https://developer.work.weixin.qq.com/document/path/100719)和 SDK `QuoteContent` 定义了 `quote.text.content` 等引用内容字段；长连接文档说明消息体结构沿用该协议。桥接从当前 `message.text` 回调读取 `quote`，提取文本或图文混排中的文字，以 Markdown 引用块与本次问题分开呈现。空引用及未接入的媒体引用用简短占位说明，不把资源 URL 当作正文或下载资源。
+企微[接收消息协议](https://developer.work.weixin.qq.com/document/path/100719)和 SDK `QuoteContent` 定义了 `quote.text.content` 等引用内容字段；长连接文档说明消息体结构沿用该协议。桥接从当前消息回调读取 `quote`，以 Markdown 引用块与本次问题分开呈现。引用的图片和图文混排图片也会上传为附件，正文不添加图片编号；空引用及其他未接入媒体使用简短占位说明，不把资源 URL 当作正文。
 
-引用中的 ASCII agent mention 使用全角 `＠` 展示，避免历史提及再次唤醒 agent；本次问题的 mention 和邮箱保持原样。引用不改变路由：私聊使用固定线程，群聊独立发起任务；不凭引用文字猜测旧任务 ID。日志仅增加 `hasQuote` 标记，不记录引用正文。
+引用中的 ASCII agent mention 使用全角 `＠` 展示，避免历史提及再次唤醒 agent；本次问题的 mention 和邮箱保持原样。引用不改变路由：私聊使用固定线程，群聊独立发起任务；不凭引用文字猜测旧任务 ID。日志记录 `hasQuote` 和 `imageCount`，不记录引用正文。
 
 本次只使用长连接消息回调携带的引用内容。其他 MCP 可能提供历史读取能力，未在此项目核实或接入；不据当前长连接接口的字段推断整个企微平台没有历史能力。
 
 代码为本项目独立实现，参考上述桥接思路；未复制原项目的状态存储、飞书业务逻辑或 agent 行为规则。第三方包遵循各自许可证；原参考项目及其许可证仍留在本地 `ref/`，不加入此 Git 仓库。
 
 参考：[企微 SDK](https://github.com/WecomTeam/aibot-node-sdk)、[企微官方协议](https://developer.work.weixin.qq.com/document/path/101463)、[Raft External Agent](https://docs.raft.build/developers/sdk/external-agents/)。
+
+## 图片输入
+
+按企微长连接协议和 SDK 1.0.7 的 `ImageContent` 定义，从独立图片、图文混排、引用图片中读取 `url` 和独立 `aeskey`。官方协议明确独立图片只推送私聊；群聊支持 @机器人发图文混排或引用问题。下载链接约 5 分钟有效，AES-256-CBC 使用密钥前 16 字节作为 IV、32 字节 PKCS#7 填充；解密直接调用官方导出的 `decryptFile`，不复制解密实现。
+
+图片的实际媒体 CDN 不应以固定域名列表猜测。下载使用 Node HTTP/HTTPS，最多 3 次重定向，每次检查 URL 和 DNS 结果，拒绝本地/内网地址并把验证过的地址固定到连接上，避免第二次 DNS 解析改变目标。请求只携带媒体 URL，不带企微或 Raft 凭据、Cookie；密钥不发送给下载服务。单次下载含 DNS、重定向及正文的限时为 15 秒，按 Content-Length 和流式累计字节双重限制大小，再检查解密后的图片格式与大小。
+
+本次保持 Raft 0.32.0 和企微 SDK 1.0.7 不变。原消息、mention、inbox 仍使用 `createRaftClient`；SDK 的附件便捷接口在 `createRaft(...).attachments.upload({ target, filename, bytes, mimeType })`，因此仅附件操作使用该 helper。它查询服务器上传能力、解析目标、按阈值选择 multipart 或直传，成功返回 `state: uploaded`、`data.id`。首次私聊/群聊上传到固定频道，后续私聊上传到同一个 thread，再用原 `messages.send({ target, content, attachmentIds, idempotencyKey })` 发消息；上传本身不触发执行 agent。
+
+参考飞书 `handler.ts` 的先准备媒体、后发送消息及保留附件 ID 思路，独立实现本版图片流程。下载、解密和所有图片上传完成后才发任务，失败时明确提示，不悄悄丢图。最多 4 张、每张 10 MiB、合计 20 MiB，服务器限额仍可能更低。失败任务的已上传 ID 在内存最多保留 100 条；同目标重试复用附件，切换了话题则拒绝把旧附件发送到新目标。已尝试消息发送但未确认的任务，后续错误也不能宣称“尚未提交”。这个缓存不跨重启，不承诺完整附件上传幂等性。
+
+图片不在本地落盘。图片按顺序作为附件发送，文件名为 `image-N.<格式>`，正文仅保留用户文字，不生成图片编号；旧 mention 的清理规则也适用于引用中的文字。只传附件，由既有 agent 决定如何读图；回企微的方向暂时仍只有文字。
 
 ## 日志与排错
 
@@ -77,6 +90,7 @@
 | `private_session_reset` / `private_session_reset_failed` | 私聊重开已保存 / 保存失败，保留原话题 |
 | `wecom_conversation_discovered` | 排错模式下收到的私聊/群聊元数据 |
 | `wecom_received` / `raft_posted` | 收到企微消息 / Raft 已确认发送 |
+| `raft_image_uploaded` / `image_transfer_failed` | 图片已上传（附件 ID、序号、大小）/ 图片准备失败；不记录 URL 或解密密钥 |
 | `raft_mention_delivery` | mention 投递状态；`pending` 尚未确认，`delivered` 已投递 |
 | `wecom_forwarded` | 企微已确认收到一段回复 |
 | `raft_send_failed` / `raft_poll_failed` | Raft 发送或读取错误 |
